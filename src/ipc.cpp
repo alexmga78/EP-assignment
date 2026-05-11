@@ -1,13 +1,13 @@
 #include "ipc.h"
-#include "stats.h"   // NUM_BUCKETS
+#include "stats.h"
 
 #include <algorithm>
 #include <cstring>
 
-// ---------------------------------------------------------------------------
-// JSON escaping helper (handle only characters that appear in filenames / paths)
-// ---------------------------------------------------------------------------
-
+// Names emitted here come from /proc/<pid>/maps and from PERF_RECORD_MMAP2
+// filenames, both of which are filesystem paths plus a few bracketed
+// pseudo-paths ("[heap]"). Only the characters that can occur in such
+// names need escaping; a fully general JSON escaper is unnecessary.
 static std::string json_escape(const std::string& s)
 {
     std::string out;
@@ -25,10 +25,6 @@ static std::string json_escape(const std::string& s)
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// Ipc implementation
-// ---------------------------------------------------------------------------
-
 Ipc::Ipc(FILE* pipe_file, bool is_pipe) : file_(pipe_file), is_pipe_(is_pipe) {}
 
 Ipc::~Ipc()
@@ -45,7 +41,6 @@ std::string Ipc::region_name(const Region* r)
 {
     if (!r) return "UNKNOWN";
     if (!r->name.empty()) return r->name;
-    // Anonymous region: use hex start address.
     char buf[32];
     std::snprintf(buf, sizeof(buf), "ANON@0x%lx", r->start);
     return buf;
@@ -56,7 +51,10 @@ void Ipc::send_sample(uint64_t ip, uint64_t addr, bool is_write, uint64_t ts_ns,
 {
     if (!file_) return;
 
-    // Compute bucket index for the accessed address.
+    // The bucket index sent on the wire must match the one computed in
+    // Stats::record() (src/stats.cpp), otherwise the live plotter heatmap
+    // and the final summary table disagree. Any change here needs the
+    // mirror change there.
     int bucket = 0;
     if (addr_region) {
         uint64_t span = addr_region->end - addr_region->start;
@@ -69,7 +67,6 @@ void Ipc::send_sample(uint64_t ip, uint64_t addr, bool is_write, uint64_t ts_ns,
         }
     }
 
-    // Region type string
     const char* type_str = "UNKNOWN";
     if (addr_region) {
         switch (addr_region->type) {

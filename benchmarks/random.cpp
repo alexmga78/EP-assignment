@@ -1,14 +1,11 @@
-// random.cpp — pseudo-random heap access benchmark.
-// Expected output: bucket histogram fills uniformly across the region.
-//
-// Usage:  ./benchmarks/random [size_mb] [iterations]
-
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
-// Fast xorshift64 PRNG — avoids libc rand() overhead.
+// xorshift64 instead of libc rand() keeps the per-iteration cost low
+// enough that the inner loop is dominated by the memory access, not the
+// RNG arithmetic - which is the property the tracer is meant to measure.
 static uint64_t xorshift64(uint64_t& state)
 {
     state ^= state << 13;
@@ -24,16 +21,17 @@ int main(int argc, char** argv)
     size_t n_bytes = size_mb * 1024 * 1024;
     size_t n_longs = n_bytes / sizeof(long);
 
+    // `volatile` is what actually keeps the compiler from eliminating
+    // the read loop below; the `if (sink == 0)` escape at the end is
+    // visible but insufficient on its own under -O2.
     auto* buf = static_cast<volatile long*>(std::malloc(n_bytes));
     if (!buf) {
         std::perror("malloc");
         return 1;
     }
 
-    // Initialise.
     for (size_t i = 0; i < n_longs; ++i) buf[i] = static_cast<long>(i);
 
-    // Random read passes.
     uint64_t state = 0xdeadbeefcafe1234ULL;
     long     sink  = 0;
     for (int it = 0; it < iters; ++it) {

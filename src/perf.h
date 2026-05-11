@@ -11,31 +11,35 @@
 #include <linux/perf_event.h>
 #include <sys/types.h>
 
-// Represents one perf event FD + its ring-buffer mapping.
+// One perf event fd plus its mmap'd ring buffer. `prev_head` is our own
+// tail cursor: the kernel only ever reads `data_tail` in the meta page,
+// so we keep a private copy of how far we've drained without touching it
+// (and only publish to `data_tail` once per drain pass).
 struct PerfEvent {
     int      fd   = -1;
-    void*    base = nullptr;    // mmap base (meta page)
-    size_t   mmap_size = 0;     // total mmap size in bytes
-    uint64_t prev_head = 0;     // last consumed data_head
+    void*    base = nullptr;
+    size_t   mmap_size = 0;
+    uint64_t prev_head = 0;
 };
 
-// Top-level perf session: manages two events (loads + stores) for one child.
+// Runs a PEBS-precise sampling group (loads + stores) against one tracee.
 class PerfSession {
 public:
     explicit PerfSession(pid_t child_pid, Maps& maps, Stats& stats, Ipc& ipc);
     ~PerfSession();
 
-    // Open perf events and mmap ring buffers. Throws on error.
+    // Opens both event fds and mmaps their ring buffers. Throws on failure
+    // - typical causes are EACCES from perf_event_paranoid > 2, and ENODEV
+    // when running on a CPU without PEBS-LL (Intel pre-Nehalem, Atom, AMD).
     void open(int ring_pages = 512);
 
-    // Enable collection (call after child is running).
     void enable();
-
-    // Disable collection.
     void disable();
 
-    // Drain all pending records from both ring buffers.
-    // Returns false when a PERF_RECORD_EXIT for our child was seen.
+    // Drains both ring buffers. Returns false once PERF_RECORD_EXIT for
+    // our child has been seen. Must be called once more after disable()
+    // at shutdown to flush records the kernel produced between the last
+    // epoll wakeup and the child's exit.
     bool drain();
 
     int load_fd()  const { return loads_.fd; }
@@ -52,14 +56,14 @@ private:
 
     bool        got_exit_ = false;
 
-    // Open a single perf event.  `is_leader` enables mmap/comm tracking.
+    // is_leader=true on the first event in the group: only the leader
+    // carries the mmap/comm/task tracking bits, so we hear about the
+    // tracee's mappings exactly once per event.
     PerfEvent open_event(uint64_t event_config, bool is_leader,
                          int group_fd, int ring_pages);
 
-    // Process all new records in one ring buffer.
     void drain_one(PerfEvent& ev, bool is_store);
 
-    // Handlers for individual record types.
     void handle_sample(const char* data, size_t size, bool is_store);
     void handle_mmap2(const char* data, size_t size);
     void handle_exit(const char* data, size_t size);

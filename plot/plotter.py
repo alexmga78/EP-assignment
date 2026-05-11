@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-"""
-Live memory-access plotter.
-
-Reads newline-delimited JSON from stdin (piped from my_tracer) and displays:
-  - Top subplot: stacked bar chart of reads/writes per CODE object (IP side).
-  - Bottom subplot: bucket heatmap per DATA region (address side).
-
-Usage: usually launched by my_tracer via popen().
-       Can also be tested standalone:
-           echo '{"ts_ns":1000000000,"ip":"0x1","addr":"0x2","rw":"r",
-                  "ip_obj":"libc.so.6","region":"[heap]",
-                  "region_type":"heap","bucket":3}' | python3 plot/plotter.py
-
-Optional arguments (passed as argv):
-    --window  N   Sliding window in seconds (default: 5).
-    --interval N  Animation interval in milliseconds (default: 500).
-"""
-
 import os
 import sys
 import json
@@ -31,8 +13,9 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from matplotlib.animation import FuncAnimation
 
-# Try interactive backends in order; fall back to WebAgg (browser-based).
-# switch_backend() does a real runtime check without creating any figure.
+# Probe interactive backends in priority order. switch_backend() raises if
+# the required GUI libraries (Tk/Qt/GTK) aren't importable, which makes
+# this loop a runtime feature test, no figure has to be created yet.
 for _backend in ("TkAgg", "Qt5Agg", "GTK3Agg", "WebAgg"):
     try:
         plt.switch_backend(_backend)
@@ -40,32 +23,31 @@ for _backend in ("TkAgg", "Qt5Agg", "GTK3Agg", "WebAgg"):
     except Exception:
         continue
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument("--window",   type=float, default=5.0)
 parser.add_argument("--interval", type=int,   default=500)
 args, _ = parser.parse_known_args()
 
-WINDOW_NS:   int = int(args.window * 1e9)   # sliding window in nanoseconds
+WINDOW_NS:   int = int(args.window * 1e9)
 INTERVAL_MS: int = args.interval
 
-NUM_BUCKETS = 64   # must match stats.h
+# Must match NUM_BUCKETS in src/stats.h; the tracer encodes the bucket
+# index per sample so the plotter doesn't recompute it (and so the two
+# sides cannot disagree about which bucket a sample belongs to).
+NUM_BUCKETS = 64
 
-# ---------------------------------------------------------------------------
-# Shared state (producer = stdin reader thread, consumer = matplotlib thread)
-# ---------------------------------------------------------------------------
+# Shared between the stdin reader thread (producer) and the matplotlib
+# animation callback (consumer). _lock guards _samples and the
+# _monitoring_ended / _exit_scheduled flags.
 _lock = threading.Lock()
 
-# Each entry: dict with keys ts_ns, rw, ip_obj, region, region_type, bucket
 _samples: Deque[dict] = collections.deque()
 _monitoring_ended = False
 _exit_scheduled   = False   # only schedule os._exit once
-_is_webagg        = False   # set after backend is chosen
+_is_webagg        = False
 
 def _reader_thread():
-    """Background thread: read JSON lines from stdin and append to _samples."""
+    """Background thread: parse NDJSON from stdin into _samples."""
     global _monitoring_ended
     for raw in sys.stdin:
         raw = raw.strip()
@@ -77,12 +59,11 @@ def _reader_thread():
             continue
         with _lock:
             _samples.append(rec)
-    # stdin closed: tracer has exited
     with _lock:
         _monitoring_ended = True
 
 def _enter_to_exit():
-    """Block until Enter is pressed on the terminal, then terminate."""
+    """Block on /dev/tty until Enter, then terminate the process."""
     try:
         with open("/dev/tty") as tty:
             tty.readline()
@@ -93,9 +74,6 @@ def _enter_to_exit():
 reader = threading.Thread(target=_reader_thread, daemon=True)
 reader.start()
 
-# ---------------------------------------------------------------------------
-# Figure setup
-# ---------------------------------------------------------------------------
 fig, (ax_code, ax_data) = plt.subplots(
     2, 1, figsize=(14, 9),
     gridspec_kw={"height_ratios": [1, 2]}
@@ -103,13 +81,13 @@ fig, (ax_code, ax_data) = plt.subplots(
 fig.suptitle("Live Memory Access Monitor", fontsize=13, fontweight="bold")
 fig.tight_layout(pad=3.0)
 
-# ---------------------------------------------------------------------------
-# Animation update
-# ---------------------------------------------------------------------------
 def update(_frame):
     with _lock:
         ended = _monitoring_ended
-        # --- prune stale samples outside the sliding window ---
+        # Drop samples that have aged out of the sliding window. The
+        # newest sample's timestamp is the anchor - wall-clock time is
+        # not used because the tracer emits CLOCK_MONOTONIC ns from
+        # perf_event_open, which can skew from time.time() by tens of µs.
         if _samples:
             latest_ts = _samples[-1]["ts_ns"]
             cutoff     = latest_ts - WINDOW_NS
@@ -118,11 +96,10 @@ def update(_frame):
 
         snapshot = list(_samples)
 
-    # Update figure title based on monitoring state.
     global _exit_scheduled
     if ended:
         if _is_webagg:
-            fig.suptitle("Memory Access Monitor  [MONITORING ENDED — press Enter in terminal to exit]",
+            fig.suptitle("Memory Access Monitor  [MONITORING ENDED - press Enter in terminal to exit]",
                          fontsize=11, fontweight="bold", color="red")
         else:
             fig.suptitle("Memory Access Monitor  [MONITORING ENDED]",
@@ -130,7 +107,10 @@ def update(_frame):
         if not _exit_scheduled:
             _exit_scheduled = True
             if _is_webagg:
-                print("\n[tracer] monitoring ended — press Enter to close the plot server.",
+                # WebAgg's Tornado server outlives the tracer; closing it
+                # from a Timer would yank the page out from under the
+                # user. Wait for an explicit keystroke instead.
+                print("\n[tracer] monitoring ended - press Enter to close the plot server.",
                       flush=True, file=sys.stderr)
                 threading.Thread(target=_enter_to_exit, daemon=True).start()
             else:
@@ -139,8 +119,6 @@ def update(_frame):
         fig.suptitle("Live Memory Access Monitor  [monitoring…]",
                      fontsize=13, fontweight="bold", color="black")
 
-    # ---------------------------------------------------------------- ax_code
-    # Aggregate reads/writes per ip_obj.
     code_reads:  Dict[str, int] = collections.defaultdict(int)
     code_writes: Dict[str, int] = collections.defaultdict(int)
     for s in snapshot:
@@ -168,9 +146,7 @@ def update(_frame):
     ax_code.set_ylabel("Sample count", fontsize=8)
     ax_code.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
 
-    # ---------------------------------------------------------------- ax_data
-    # Aggregate per-region per-bucket.
-    # bucket_data[region] = list of (reads, writes) length NUM_BUCKETS
+    # bucket_data[region][bucket] = (reads, writes)
     bucket_data: Dict[str, List[Tuple[int, int]]] = {}
     for s in snapshot:
         region = s.get("region", "UNKNOWN")
@@ -190,7 +166,9 @@ def update(_frame):
         n_regions = len(regions)
         bar_width = 0.8 / max(n_regions, 1)
 
-        # Fixed: reads=blue, writes=orange. Regions distinguished by hatch.
+        # Encoding: colour = read/write, hatch = region. Side-by-side bars
+        # per bucket keep regions visually separable even when one region
+        # dominates the sample count.
         READ_COLOR  = "#4e8df5"
         WRITE_COLOR = "#f5704e"
         HATCHES = ["", "//", "xx", "..", "++", "\\\\", "oo"]
@@ -208,7 +186,6 @@ def update(_frame):
                         color=WRITE_COLOR, alpha=0.85, hatch=hatch,
                         bottom=rs)
 
-        # Build legend: one entry per region (by hatch) + reads/writes color key.
         legend_handles = []
         for i, region in enumerate(regions):
             hatch = HATCHES[i % len(HATCHES)]
@@ -236,7 +213,6 @@ def update(_frame):
 anim = FuncAnimation(fig, update, interval=INTERVAL_MS, blit=False,
                      cache_frame_data=False)
 
-# For WebAgg: print the URL so the user knows where to open it.
 if matplotlib.get_backend() == "WebAgg":
     _is_webagg = True
     port = int(matplotlib.rcParams.get("webagg.port", 8988))

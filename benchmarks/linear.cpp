@@ -1,8 +1,3 @@
-// linear.cpp — sequential heap traversal benchmark.
-// Expected output: bucket histogram fills left-to-right.
-//
-// Usage:  ./benchmarks/linear [size_mb] [iterations]
-
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +9,9 @@ int main(int argc, char** argv)
     size_t n_bytes   = size_mb * 1024 * 1024;
     size_t n_longs   = n_bytes / sizeof(long);
 
+    // `volatile` is what actually keeps the compiler from eliminating
+    // the read loop below; the `if (sink == 0)` escape at the end is
+    // visible but insufficient on its own under -O2.
     auto* buf = static_cast<volatile long*>(
         std::malloc(n_bytes));
     if (!buf) {
@@ -21,10 +19,8 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Initialise (write pass).
     for (size_t i = 0; i < n_longs; ++i) buf[i] = static_cast<long>(i);
 
-    // Read passes: sequential left-to-right.
     long sink = 0;
     for (int it = 0; it < iters; ++it) {
         for (size_t i = 0; i < n_longs; ++i) {
@@ -32,7 +28,6 @@ int main(int argc, char** argv)
         }
     }
 
-    // Prevent optimisation.
     if (sink == 0) std::puts("zero");
 
     std::free(const_cast<long*>(buf));
