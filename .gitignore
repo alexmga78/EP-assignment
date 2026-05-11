@@ -1,3 +1,17 @@
-src/*.o
-bin/*
-benchmarks/*.bin
+# Build
+build/
+my_tracer
+benchmarks/linear
+benchmarks/random
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+*.swp
+*.swo
+
+# Extra
+*.zip

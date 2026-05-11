@@ -1,131 +1,366 @@
-// memtracer entry point.
-//
-// Usage:
-//   memtracer [--sink=text|jsonl] [--period=N] [--snapshot-ms=N]
-//             [--window=N] [--mmap-pages=N] [--no-mmap-data]
-//             -- CHILD_CMD [CHILD ARGS...]
-//
-// Everything after the literal "--" is the program-under-test invocation
-// passed verbatim to execvp() in the child process.
+#include "maps.h"
+#include "stats.h"
+#include "ipc.h"
+#include "perf.h"
 
-#include "options.hpp"
-#include "tracer.hpp"
-
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
-#include <string_view>
 #include <vector>
 
-using namespace memtracer;
+#include <fstream>
+#include <sstream>
 
-namespace {
+#include <sched.h>
+#include <signal.h>
+#include <sys/epoll.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
-void print_usage(const char* prog) {
-    std::fprintf(stderr,
-        "Usage: %s [tracer-flags] -- CHILD_CMD [CHILD_ARGS...]\n"
-        "\n"
-        "Tracer flags:\n"
-        "  --sink={text,jsonl}    output sink (default: jsonl)\n"
-        "  --period=N             sample every N retired mem ops (default: 10000)\n"
-        "  --snapshot-ms=N        snapshot cadence in ms (default: 250)\n"
-        "  --window=N             rolling window in ms; 0 = lifetime (default: 0)\n"
-        "  --mmap-pages=N         perf ring data pages, must be power of 2 (default: 128)\n"
-        "  --no-mmap-data         do not request mmaps for non-executable regions\n"
-        "  --help                 this message\n",
-        prog);
-}
+// ---------------------------------------------------------------------------
+// Global flag set by SIGCHLD so the event loop can exit cleanly.
+// ---------------------------------------------------------------------------
+static volatile sig_atomic_t g_child_exited = 0;
 
-bool parse_uint(std::string_view s, uint64_t& out) {
-    if (s.empty()) return false;
-    out = 0;
-    for (char c : s) {
-        if (c < '0' || c > '9') return false;
-        out = out * 10 + (uint64_t)(c - '0');
-    }
-    return true;
-}
+static void sigchld_handler(int) { g_child_exited = 1; }
 
-bool starts_with(std::string_view s, std::string_view prefix) {
-    return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
-}
+// ---------------------------------------------------------------------------
+// Pin a process to the P-cores (cpu_core PMU) on hybrid Intel CPUs.
+// Reads the CPU list from /sys/bus/event_source/devices/cpu_core/cpus.
+// Falls back silently if the file doesn't exist (non-hybrid system).
+// ---------------------------------------------------------------------------
+static void pin_to_pcores(pid_t pid)
+{
+    std::ifstream f("/sys/bus/event_source/devices/cpu_core/cpus");
+    if (!f) return; // non-hybrid, nothing to do
 
-// Returns true on success; false on parse error (with message printed).
-bool parse_args(int argc, char** argv, Options& opts) {
-    int i = 1;
-    bool seen_dashdash = false;
+    std::string line;
+    if (!std::getline(f, line)) return;
 
-    for (; i < argc; ++i) {
-        std::string_view a = argv[i];
-        if (a == "--") { seen_dashdash = true; ++i; break; }
-        if (a == "--help" || a == "-h") { print_usage(argv[0]); std::exit(0); }
+    cpu_set_t set;
+    CPU_ZERO(&set);
 
-        if (a == "--no-mmap-data") {
-            opts.mmap_data = false;
-        } else if (starts_with(a, "--sink=")) {
-            std::string_view v = a.substr(std::string_view("--sink=").size());
-            if (v == "text") opts.sink = SinkKind::Text;
-            else if (v == "jsonl") opts.sink = SinkKind::Jsonl;
-            else { std::fprintf(stderr, "unknown sink: %.*s\n", (int)v.size(), v.data()); return false; }
-        } else if (starts_with(a, "--period=")) {
-            uint64_t v; if (!parse_uint(a.substr(9), v) || v == 0) {
-                std::fprintf(stderr, "bad --period\n"); return false;
-            }
-            opts.sample_period = v;
-        } else if (starts_with(a, "--snapshot-ms=")) {
-            uint64_t v; if (!parse_uint(a.substr(14), v)) {
-                std::fprintf(stderr, "bad --snapshot-ms\n"); return false;
-            }
-            opts.snapshot_ms = (uint32_t)v;
-        } else if (starts_with(a, "--window=")) {
-            uint64_t v; if (!parse_uint(a.substr(9), v)) {
-                std::fprintf(stderr, "bad --window\n"); return false;
-            }
-            opts.window_ms = (uint32_t)v;
-        } else if (starts_with(a, "--mmap-pages=")) {
-            uint64_t v; if (!parse_uint(a.substr(13), v) || v == 0 || (v & (v - 1)) != 0) {
-                std::fprintf(stderr, "--mmap-pages must be a power of two\n"); return false;
-            }
-            // store log2
-            uint32_t lg = 0;
-            while ((1u << lg) < v) ++lg;
-            opts.mmap_pages_log2 = lg;
+    // Parse a cpulist like "0-7,16" into individual CPU numbers.
+    std::istringstream ss(line);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        std::size_t dash = token.find('-');
+        if (dash == std::string::npos) {
+            int cpu = std::stoi(token);
+            CPU_SET(cpu, &set);
         } else {
-            std::fprintf(stderr, "unknown flag: %.*s (use --help)\n", (int)a.size(), a.data());
-            return false;
+            int lo = std::stoi(token.substr(0, dash));
+            int hi = std::stoi(token.substr(dash + 1));
+            for (int c = lo; c <= hi; ++c)
+                CPU_SET(c, &set);
         }
     }
 
-    if (!seen_dashdash) {
-        std::fprintf(stderr, "missing '--' before child command\n");
-        return false;
-    }
-
-    for (; i < argc; ++i) opts.child_argv.emplace_back(argv[i]);
-
-    if (opts.child_argv.empty()) {
-        std::fprintf(stderr, "no child command given after '--'\n");
-        return false;
-    }
-    return true;
+    if (sched_setaffinity(pid, sizeof(set), &set) < 0)
+        std::perror("sched_setaffinity (pin to P-cores)");
 }
 
-}  // namespace
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+struct Config
+{
+	int ring_pages = 512;				  // perf ring buffer size (power-of-2 pages)
+	bool no_plot = false;				  // disable Python plotter
+	std::vector<const char *> child_argv; // program + args to exec
+};
 
-int main(int argc, char** argv) {
-    Options opts;
-    if (!parse_args(argc, argv, opts)) {
-        print_usage(argv[0]);
-        return 2;
-    }
+static void usage(const char *prog)
+{
+	std::fprintf(stderr,
+				 "Usage: %s [--ring-pages N] [--no-plot] -- <program> [args...]\n"
+				 "       %s [--ring-pages N] [--no-plot] <program> [args...]\n",
+				 prog, prog);
+}
 
-    try {
-        Tracer tracer(std::move(opts));
-        return tracer.run();
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "memtracer: fatal: %s\n", e.what());
-        return 1;
-    }
+static Config parse_args(int argc, char **argv)
+{
+	Config cfg;
+	int i = 1;
+
+	// Parse tracer flags (before optional '--').
+	for (; i < argc; ++i)
+	{
+		std::string arg(argv[i]);
+		if (arg == "--")
+		{
+			++i;
+			break;
+		}
+		if (arg == "--no-plot")
+		{
+			cfg.no_plot = true;
+			continue;
+		}
+		if (arg == "--ring-pages" && i + 1 < argc)
+		{
+			cfg.ring_pages = std::atoi(argv[++i]);
+			continue;
+		}
+		// Not a known flag — treat as start of child argv.
+		break;
+	}
+
+	if (i >= argc)
+	{
+		usage(argv[0]);
+		std::exit(EXIT_FAILURE);
+	}
+
+	for (; i < argc; ++i)
+		cfg.child_argv.push_back(argv[i]);
+	cfg.child_argv.push_back(nullptr); // execvp sentinel
+
+	return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+int main(int argc, char **argv)
+{
+	if (argc < 2)
+	{
+		usage(argv[0]);
+		return EXIT_FAILURE;
+	}
+
+	Config cfg = parse_args(argc, argv);
+
+	// ------------------------------------------------------------------ fork
+	pid_t child = fork();
+	if (child < 0)
+	{
+		std::perror("fork");
+		return EXIT_FAILURE;
+	}
+
+	if (child == 0)
+	{
+		// Child: stop so the parent can set up perf before we actually run.
+		raise(SIGSTOP);
+		execvp(cfg.child_argv[0],
+			   const_cast<char *const *>(cfg.child_argv.data()));
+		std::perror("execvp");
+		_exit(EXIT_FAILURE);
+	}
+
+	// Parent: wait for child to reach SIGSTOP.
+	int wstatus = 0;
+	if (waitpid(child, &wstatus, WUNTRACED) < 0)
+	{
+		std::perror("waitpid");
+		kill(child, SIGKILL);
+		return EXIT_FAILURE;
+	}
+	if (!WIFSTOPPED(wstatus))
+	{
+		std::fprintf(stderr, "Child did not stop as expected\n");
+		kill(child, SIGKILL);
+		return EXIT_FAILURE;
+	}
+
+	// On hybrid Intel CPUs (Alder Lake+), MEM_INST_RETIRED events only exist
+	// on P-cores. Pin the child to P-cores so our cpu_core events always fire.
+	pin_to_pcores(child);
+
+	// -------------------------------------------------------- perf + IPC setup
+	Maps maps;
+	maps.seed(child);
+
+	// Open plotter subprocess (or /dev/null if --no-plot).
+	FILE *plot_pipe = nullptr;
+	bool  plot_is_pipe = false;
+	if (!cfg.no_plot)
+	{
+		plot_pipe = popen("python3 plot/plotter.py", "w");
+		if (!plot_pipe)
+		{
+			std::perror("popen plotter");
+			// Non-fatal: continue without live plot.
+			cfg.no_plot = true;
+		}
+		else
+		{
+			plot_is_pipe = true;
+		}
+	}
+	if (!plot_pipe)
+	{
+		// Dummy sink so Ipc always has a valid FILE*.
+		plot_pipe = fopen("/dev/null", "w");
+	}
+
+	Stats stats;
+	Ipc ipc(plot_pipe, plot_is_pipe);
+
+	PerfSession perf(child, maps, stats, ipc);
+	try
+	{
+		perf.open(cfg.ring_pages);
+	}
+	catch (const std::exception &ex)
+	{
+		std::fprintf(stderr, "Failed to open perf events: %s\n", ex.what());
+		kill(child, SIGKILL);
+		return EXIT_FAILURE;
+	}
+
+	// ---------------------------------------------------- resume child
+	struct sigaction sa{};
+	sa.sa_handler = sigchld_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+	sigaction(SIGCHLD, &sa, nullptr);
+
+	perf.enable();
+	kill(child, SIGCONT);
+
+	// ----------------------------------------------------- epoll event loop
+	int epfd = epoll_create1(0);
+	if (epfd < 0)
+	{
+		std::perror("epoll_create1");
+		return EXIT_FAILURE;
+	}
+
+	auto add_fd = [&](int fd)
+	{
+		struct epoll_event ev{};
+		ev.events = EPOLLIN;
+		ev.data.fd = fd;
+		epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+	};
+	add_fd(perf.load_fd());
+	add_fd(perf.store_fd());
+
+	auto last_flush = std::chrono::steady_clock::now();
+	constexpr int FLUSH_MS = 100;
+
+	while (!g_child_exited)
+	{
+		struct epoll_event events[4];
+		int n = epoll_wait(epfd, events, 4, FLUSH_MS);
+
+		if (n < 0 && errno != EINTR)
+		{
+			std::perror("epoll_wait");
+			break;
+		}
+
+		// Drain both ring buffers regardless of which FD fired.
+		bool keep_going = perf.drain();
+
+		auto now = std::chrono::steady_clock::now();
+		if (std::chrono::duration_cast<std::chrono::milliseconds>(
+				now - last_flush)
+				.count() >= FLUSH_MS)
+		{
+			ipc.flush();
+			last_flush = now;
+		}
+
+		if (!keep_going)
+			break;
+	}
+
+	// Final drain after child exits.
+	perf.disable();
+	perf.drain();
+	ipc.flush();
+
+	// Collect child exit status.
+	waitpid(child, &wstatus, 0);
+	close(epfd);
+
+	std::fprintf(stderr, "\n[tracer] child process exited — collecting final samples...\n");
+
+	// --------------------------------------------------------- print summary
+	std::printf("\n=== Memory Access Summary ===\n\n");
+
+	// --- Code objects: sort by total accesses descending, skip zeros ---
+	{
+		using Entry = std::pair<std::string, CodeStats>;
+		std::vector<Entry> code_vec(stats.code_stats().begin(),
+		                            stats.code_stats().end());
+		std::sort(code_vec.begin(), code_vec.end(),
+		    [](const Entry& a, const Entry& b) {
+		        return (a.second.reads + a.second.writes) >
+		               (b.second.reads + b.second.writes);
+		    });
+
+		std::printf("-- Code objects (instruction side) --\n");
+		std::printf("  %-34s %12s %12s\n", "Object", "Reads", "Writes");
+		for (auto &[name, cs] : code_vec)
+		{
+			if (cs.reads == 0 && cs.writes == 0) continue;
+			std::printf("  %-34s %12lu %12lu\n",
+			            name.c_str(), cs.reads, cs.writes);
+		}
+	}
+
+	// --- Data regions: sort by total accesses descending, skip zeros ---
+	{
+		struct Row { std::string label; std::string type_str; uint64_t reads; uint64_t writes; };
+		std::vector<Row> rows;
+
+		auto type_name = [](RegionType t) -> const char* {
+			switch (t) {
+				case RegionType::HEAP:      return "heap";
+				case RegionType::STACK:     return "stack";
+				case RegionType::FILE_TEXT: return "text";
+				case RegionType::FILE_DATA: return "data";
+				case RegionType::VDSO:      return "vdso";
+				case RegionType::ANON:      return "anon";
+				default:                    return "unknown";
+			}
+		};
+
+		for (auto &[key, rs] : stats.region_stats())
+		{
+			uint64_t total_r = 0, total_w = 0;
+			for (auto &b : rs.buckets) { total_r += b.reads; total_w += b.writes; }
+			if (total_r == 0 && total_w == 0) continue;
+
+			// For anonymous/heap/stack regions, append address range so
+			// multiple distinct anon mappings are distinguishable.
+			std::string label = rs.name;
+			if (rs.type == RegionType::ANON  ||
+			    rs.type == RegionType::HEAP  ||
+			    rs.type == RegionType::STACK ||
+			    rs.name == "anon")
+			{
+				char buf[64];
+				std::snprintf(buf, sizeof(buf), " [%lx-%lx]",
+				              (unsigned long)rs.start, (unsigned long)rs.end);
+				label += buf;
+			}
+
+			rows.push_back({label, type_name(rs.type), total_r, total_w});
+		}
+
+		std::sort(rows.begin(), rows.end(),
+		    [](const Row& a, const Row& b) {
+		        return (a.reads + a.writes) > (b.reads + b.writes);
+		    });
+
+		std::printf("\n-- Data regions (address side) --\n");
+		std::printf("  %-44s %-7s %12s %12s\n", "Region", "Type", "Reads", "Writes");
+		for (auto &r : rows)
+			std::printf("  %-44s %-7s %12lu %12lu\n",
+			            r.label.c_str(), r.type_str.c_str(), r.reads, r.writes);
+	}
+
+	return WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : EXIT_FAILURE;
 }
